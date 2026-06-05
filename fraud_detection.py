@@ -53,6 +53,10 @@ _REQUIRED_FIELDS = ("transaction_id", "user_id", "amount", "currency", "merchant
 _GEO_WINDOW_HOURS = 24
 _AMOUNT_HISTORY_MIN = 3
 _AMOUNT_SPIKE_FACTOR = 10
+_FREQ_WINDOW_HOURS = 1
+_FREQ_THRESHOLD = 5
+_CARD_NOT_PRESENT_MIN = 500
+_CARD_SPIKE_FACTOR = 3
 
 
 def _parse_timestamp(value):
@@ -84,12 +88,28 @@ def _missing_fields(transaction):
     return missing
 
 
-def _user_history(transactions, user_id, before_index):
-    return [
-        tx
-        for idx, tx in enumerate(transactions)
-        if idx < before_index and tx.get("user_id") == user_id
-    ]
+def _user_history(transactions, user_id, current_index, current_tx):
+    """Historique chronologique du client, indépendant de l'ordre du fichier."""
+    current_ts = _parse_timestamp(current_tx.get("timestamp"))
+    history = []
+
+    for idx, tx in enumerate(transactions):
+        if idx == current_index or tx.get("user_id") != user_id:
+            continue
+
+        if current_ts is not None:
+            tx_ts = _parse_timestamp(tx.get("timestamp"))
+            if tx_ts is not None:
+                if tx_ts >= current_ts:
+                    continue
+            elif idx >= current_index:
+                continue
+        elif idx >= current_index:
+            continue
+
+        history.append(tx)
+
+    return history
 
 
 def _user_batch(transactions, user_id):
@@ -113,15 +133,35 @@ def _has_rapid_country_change(transaction, batch):
     return False
 
 
-def _is_amount_spike(amount, history):
-    if amount is None or amount <= 0:
+def _has_abnormal_frequency(transaction, batch):
+    ts = _parse_timestamp(transaction.get("timestamp"))
+    if ts is None:
         return False
 
-    prior_amounts = [
+    count = 0
+    for other in batch:
+        other_ts = _parse_timestamp(other.get("timestamp"))
+        if other_ts is None:
+            continue
+        if abs((ts - other_ts).total_seconds()) / 3600 <= _FREQ_WINDOW_HOURS:
+            count += 1
+
+    return count >= _FREQ_THRESHOLD
+
+
+def _prior_amounts(history):
+    return [
         tx.get("amount")
         for tx in history
         if isinstance(tx.get("amount"), (int, float)) and tx.get("amount") > 0
     ]
+
+
+def _is_amount_spike(amount, history):
+    if amount is None or amount <= 0:
+        return False
+
+    prior_amounts = _prior_amounts(history)
     if len(prior_amounts) < _AMOUNT_HISTORY_MIN:
         return False
 
@@ -129,6 +169,34 @@ def _is_amount_spike(amount, history):
     if baseline <= 0:
         return False
     return amount >= baseline * _AMOUNT_SPIKE_FACTOR
+
+
+def _is_card_not_present_risk(transaction, history):
+    if transaction.get("card_present") is not False:
+        return False
+
+    amount = transaction.get("amount")
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        return False
+
+    if amount >= _CARD_NOT_PRESENT_MIN:
+        return True
+
+    prior_amounts = _prior_amounts(history)
+    prior_card_flags = [
+        tx.get("card_present")
+        for tx in history
+        if tx.get("card_present") is not None
+    ]
+    if len(prior_amounts) < _AMOUNT_HISTORY_MIN or len(prior_card_flags) < _AMOUNT_HISTORY_MIN:
+        return False
+
+    if all(prior_card_flags):
+        baseline = statistics.median(prior_amounts)
+        if baseline > 0 and amount >= baseline * _CARD_SPIKE_FACTOR:
+            return True
+
+    return False
 
 
 def _build_result(transaction_id, fraud_score, is_suspicious, reason):
@@ -147,6 +215,7 @@ def detect_fraud(transactions):
     is_suspicious (bool), reason (str) — un résultat par transaction, même ordre.
     """
     results = []
+    seen_ids = set()
 
     for index, transaction in enumerate(transactions):
         transaction_id = transaction.get("transaction_id") or f"UNKNOWN-{index}"
@@ -162,6 +231,8 @@ def detect_fraud(transactions):
                     "Montant nul ou négatif",
                 )
             )
+            if transaction_id and not transaction_id.startswith("UNKNOWN-"):
+                seen_ids.add(transaction_id)
             continue
 
         if missing:
@@ -174,10 +245,23 @@ def detect_fraud(transactions):
                     f"Champs obligatoires manquants: {fields}",
                 )
             )
+            if transaction_id and not transaction_id.startswith("UNKNOWN-"):
+                seen_ids.add(transaction_id)
+            continue
+
+        if transaction_id in seen_ids:
+            results.append(
+                _build_result(
+                    transaction_id,
+                    0.87,
+                    True,
+                    "Transaction en double détectée",
+                )
+            )
             continue
 
         user_id = transaction.get("user_id")
-        history = _user_history(transactions, user_id, index)
+        history = _user_history(transactions, user_id, index, transaction)
         batch = _user_batch(transactions, user_id)
 
         if _has_rapid_country_change(transaction, batch):
@@ -189,6 +273,19 @@ def detect_fraud(transactions):
                     "Deux pays différents en trop peu de temps",
                 )
             )
+            seen_ids.add(transaction_id)
+            continue
+
+        if _has_abnormal_frequency(transaction, batch):
+            results.append(
+                _build_result(
+                    transaction_id,
+                    0.86,
+                    True,
+                    "Fréquence de transactions anormale",
+                )
+            )
+            seen_ids.add(transaction_id)
             continue
 
         if _is_amount_spike(amount, history):
@@ -200,6 +297,19 @@ def detect_fraud(transactions):
                     "Montant très supérieur à l'habitude du client",
                 )
             )
+            seen_ids.add(transaction_id)
+            continue
+
+        if _is_card_not_present_risk(transaction, history):
+            results.append(
+                _build_result(
+                    transaction_id,
+                    0.84,
+                    True,
+                    "Paiement sans carte physique inhabituel",
+                )
+            )
+            seen_ids.add(transaction_id)
             continue
 
         results.append(
@@ -210,5 +320,6 @@ def detect_fraud(transactions):
                 "Transaction conforme au profil du client",
             )
         )
+        seen_ids.add(transaction_id)
 
     return results
