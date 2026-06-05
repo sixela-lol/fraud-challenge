@@ -7,3 +7,5 @@ venv/
 # Réservé organisateurs — ne pas publier sur le dépôt participants
 organisateur/
 Ressources/
+data/analysis_history.json
+models/
