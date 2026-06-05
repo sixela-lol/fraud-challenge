@@ -81,6 +81,7 @@ def verify_transactions(transactions, rule_results, ml_bundle, threshold=0.55):
             "country": tx.get("country"),
             "rule_flag": rule_flag,
             "rule_reason": res.get("reason"),
+            "rule_score": round(float(res.get("fraud_score") or 0), 2),
             "model_score": score,
             "model_flag": model_flag,
             "status": status,

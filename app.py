@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
@@ -280,6 +281,145 @@ def _build_report(transactions, results) -> str:
     return "\n".join(lines)
 
 
+def _score_timeline(transactions, results):
+    """Courbe d'évolution du score de risque dans le temps."""
+    rows = []
+    for i, (tx, r) in enumerate(zip(transactions, results)):
+        ts = tx.get("timestamp")
+        try:
+            t = datetime.fromisoformat(str(ts).replace("Z", "+00:00")) if ts else None
+        except (TypeError, ValueError):
+            t = None
+        rows.append({
+            "ordre": i,
+            "temps": t,
+            "score": float(r.get("fraud_score") or 0),
+            "ref": r.get("transaction_id"),
+            "statut": "Suspecte" if r.get("is_suspicious") else "Normale",
+        })
+    df = pd.DataFrame(rows)
+    has_time = df["temps"].notna().any()
+    x_field = "temps:T" if has_time else "ordre:Q"
+    x_title = "Temps" if has_time else "Ordre des transactions"
+    if has_time:
+        df = df.sort_values("temps")
+
+    base = alt.Chart(df).encode(
+        x=alt.X(x_field, title=x_title),
+    )
+    area = base.mark_area(
+        line={"color": "#3b82f6", "size": 2},
+        color=alt.Gradient(
+            gradient="linear",
+            stops=[
+                alt.GradientStop(color="#3b82f600", offset=0),
+                alt.GradientStop(color="#3b82f655", offset=1),
+            ],
+            x1=1, x2=1, y1=1, y2=0,
+        ),
+    ).encode(
+        y=alt.Y("score:Q", title="Score de risque", scale=alt.Scale(domain=[0, 1])),
+    )
+    points = base.mark_circle(size=90).encode(
+        y="score:Q",
+        color=alt.condition(
+            alt.datum.statut == "Suspecte",
+            alt.value("#dc2626"), alt.value("#22c55e"),
+        ),
+        tooltip=["ref:N", "statut:N", alt.Tooltip("score:Q", format=".2f")],
+    )
+    return (area + points).properties(height=240)
+
+
+def _suspicion_color(rate: float) -> str:
+    if rate >= 30:
+        return "#dc2626"   # rouge — risque élevé
+    if rate >= 10:
+        return "#f59e0b"   # orange — vigilance
+    return "#22c55e"        # vert — sain
+
+
+def _ring_gauge(pct: float, color: str):
+    """Jauge en anneau générique : portion colorée = pct (0-100)."""
+    ring = pd.DataFrame({
+        "seg": ["Valeur", "Reste"],
+        "val": [max(pct, 0.01), max(100 - pct, 0.01)],
+        "col": [color, "#33415540"],
+    })
+    arc = (
+        alt.Chart(ring)
+        .mark_arc(innerRadius=62, outerRadius=88, cornerRadius=4)
+        .encode(
+            theta=alt.Theta("val:Q", stack=True),
+            color=alt.Color("col:N", scale=None, legend=None),
+            order=alt.Order("seg:N", sort="ascending"),
+        )
+    )
+    center = (
+        alt.Chart(pd.DataFrame({"t": [f"{pct:.0f}%"]}))
+        .mark_text(size=34, fontWeight="bold", color=color)
+        .encode(text="t:N")
+    )
+    return (arc + center).properties(height=220)
+
+
+def _suspicion_gauge(rate: float):
+    """Jauge du taux de suspicion (haut = rouge)."""
+    return _ring_gauge(rate, _suspicion_color(rate))
+
+
+def _accord_gauge(pct: float):
+    """Jauge du taux d'accord (haut = vert, c'est rassurant)."""
+    color = "#22c55e" if pct >= 80 else "#f59e0b" if pct >= 50 else "#dc2626"
+    return _ring_gauge(pct, color)
+
+
+def _pred_compare_curve(rows):
+    """Courbe règles vs modèle + nuage de points des désaccords."""
+    long = []
+    for i, r in enumerate(rows):
+        long.append({"ordre": i, "ref": r["transaction_id"], "Source": "Règles", "score": r.get("rule_score", 0)})
+        long.append({"ordre": i, "ref": r["transaction_id"], "Source": "Modèle", "score": r.get("model_score", 0)})
+    df = pd.DataFrame(long)
+    curve = (
+        alt.Chart(df)
+        .mark_line(point=True, strokeWidth=2)
+        .encode(
+            x=alt.X("ordre:Q", title="Transactions"),
+            y=alt.Y("score:Q", title="Score", scale=alt.Scale(domain=[0, 1])),
+            color=alt.Color("Source:N", scale=alt.Scale(
+                domain=["Règles", "Modèle"], range=["#3b82f6", "#f59e0b"])),
+            tooltip=["ref:N", "Source:N", alt.Tooltip("score:Q", format=".2f")],
+        )
+        .properties(height=260)
+    )
+    return curve
+
+
+def _pred_scatter(rows):
+    """Nuage de points modèle vs règles, coloré par verdict croisé."""
+    df = pd.DataFrame([{
+        "ref": r["transaction_id"],
+        "Score règles": r.get("rule_score", 0),
+        "Score modèle": r.get("model_score", 0),
+        "Verdict": r["status_label"],
+        "col": r["status_color"],
+    } for r in rows])
+    return (
+        alt.Chart(df)
+        .mark_circle(size=140, opacity=0.85)
+        .encode(
+            x=alt.X("Score règles:Q", scale=alt.Scale(domain=[0, 1])),
+            y=alt.Y("Score modèle:Q", scale=alt.Scale(domain=[0, 1])),
+            color=alt.Color("col:N", scale=None, legend=None),
+            tooltip=["ref:N", "Verdict:N",
+                     alt.Tooltip("Score règles:Q", format=".2f"),
+                     alt.Tooltip("Score modèle:Q", format=".2f")],
+        )
+        .properties(height=260)
+    )
+
+
 def _render_home(transactions, results) -> None:
     alerts = _alert_pairs(transactions, results)
     ok_count = len(results) - len(alerts)
@@ -298,19 +438,22 @@ def _render_home(transactions, results) -> None:
     # --- Rangée de graphiques ---
     g1, g2, g3 = st.columns(3)
     with g1:
-        st.markdown('<p class="panel-title">Répartition</p>', unsafe_allow_html=True)
-        df = pd.DataFrame({"Type": ["Alertes", "Normales"], "Nb": [len(alerts), ok_count]})
-        st.bar_chart(df.set_index("Type"), color=st.session_state.accent, height=190)
+        level = "Risque élevé" if rate >= 30 else "Vigilance" if rate >= 10 else "Situation saine"
+        st.markdown(
+            f'<p class="panel-title">Taux de suspicion — {level}</p>',
+            unsafe_allow_html=True,
+        )
+        st.altair_chart(_suspicion_gauge(rate), use_container_width=True)
     with g2:
         st.markdown('<p class="panel-title">Niveaux de risque</p>', unsafe_allow_html=True)
-        buckets = {"Faible (0-0.4)": 0, "Moyen (0.4-0.7)": 0, "Élevé (0.7-1)": 0}
+        buckets = {"Faible": 0, "Moyen": 0, "Élevé": 0}
         for r in results:
             s = float(r.get("fraud_score") or 0)
-            key = "Faible (0-0.4)" if s < 0.4 else "Moyen (0.4-0.7)" if s < 0.7 else "Élevé (0.7-1)"
+            key = "Faible" if s < 0.4 else "Moyen" if s < 0.7 else "Élevé"
             buckets[key] += 1
         st.bar_chart(
             pd.DataFrame({"Niveau": list(buckets), "Nb": list(buckets.values())}).set_index("Niveau"),
-            color=st.session_state.accent, height=190,
+            color=st.session_state.accent, height=220, horizontal=True,
         )
     with g3:
         st.markdown('<p class="panel-title">Alertes par pays</p>', unsafe_allow_html=True)
@@ -320,10 +463,15 @@ def _render_home(transactions, results) -> None:
             st.bar_chart(
                 pd.DataFrame({"Pays": [s["pays"] for s in top],
                               "Alertes": [s["alertes"] for s in top]}).set_index("Pays"),
-                color="#dc2626", height=190,
+                color="#dc2626", height=220, horizontal=True,
             )
         else:
             st.caption("Aucune alerte géolocalisée.")
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+    st.markdown('<p class="panel-title">Évolution du risque dans le temps</p>', unsafe_allow_html=True)
+    st.altair_chart(_score_timeline(transactions, results), use_container_width=True)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
@@ -694,11 +842,21 @@ def _render_verify(transactions, results) -> None:
                 unsafe_allow_html=True,
             )
 
-    st.markdown(
-        f"<p style='margin-top:10px'>Les deux couches sont d'accord à "
-        f"<strong>{summary.get('accord_pct', 0)}%</strong>.</p>",
-        unsafe_allow_html=True,
+    # Graphiques : jauge d'accord + comparaison règles/modèle + désaccords
+    ga, gb = st.columns([1, 2])
+    with ga:
+        st.markdown('<p class="panel-title">Taux d\'accord règles ↔ modèle</p>', unsafe_allow_html=True)
+        st.altair_chart(_accord_gauge(float(summary.get("accord_pct", 0))), use_container_width=True)
+    with gb:
+        st.markdown('<p class="panel-title">Score par transaction : règles vs modèle</p>', unsafe_allow_html=True)
+        st.altair_chart(_pred_compare_curve(rows), use_container_width=True)
+
+    st.markdown('<p class="panel-title">Nuage de points — repérer les désaccords</p>', unsafe_allow_html=True)
+    st.caption(
+        "Diagonale = accord. En haut à gauche : le modèle doute alors que les règles "
+        "laissent passer (à vérifier). En bas à droite : les règles alertent mais le modèle rassure."
     )
+    st.altair_chart(_pred_scatter(rows), use_container_width=True)
 
     # Le coeur de la demande : transactions « normales » que le modèle conteste
     a_verifier = [r for r in rows if r["status"] == "a_verifier"]

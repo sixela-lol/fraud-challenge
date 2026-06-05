@@ -71,8 +71,12 @@ def get_theme(name: str) -> dict:
 def build_css(theme: dict, accent: str | None = None, radius: int = 12, density: str = "confort") -> str:
     """Génère le CSS complet à partir d'un thème et d'options live."""
     accent = accent or theme["accent"]
-    pad = "0.55rem 0.85rem" if density == "compact" else "0.85rem 1.1rem"
-    tile_h = 78 if density == "compact" else 92
+    compact = density == "compact"
+    pad = "0.55rem 0.85rem" if compact else "0.95rem 1.2rem"
+    tile_h = 82 if compact else 104
+    base_font = 14.5 if compact else 16.5
+    nav_font = 0.84 if compact else 0.95
+    tile_val = 1.6 if compact else 2.0
 
     return f"""
 <style>
@@ -84,6 +88,8 @@ def build_css(theme: dict, accent: str | None = None, radius: int = 12, density:
     }}
 
     html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
+    .stApp {{ font-size: {base_font}px; }}
+    .main p, .main li, .main label, .stMarkdown {{ font-size: {base_font}px; }}
 
     .stApp {{
         background:
@@ -114,8 +120,8 @@ def build_css(theme: dict, accent: str | None = None, radius: int = 12, density:
         margin-bottom: 10px;
         display: flex; justify-content: space-between; align-items: center;
     }}
-    .dash-header h1 {{ margin: 0; font-size: 1.35rem; font-weight: 800; }}
-    .dash-header span {{ font-size: 0.8rem; color: {theme['muted']}; }}
+    .dash-header h1 {{ margin: 0; font-size: 1.6rem; font-weight: 800; }}
+    .dash-header span {{ font-size: 0.9rem; color: {theme['muted']}; }}
 
     .pulse-dot {{
         display:inline-block; width:9px; height:9px; border-radius:50%;
@@ -138,17 +144,17 @@ def build_css(theme: dict, accent: str | None = None, radius: int = 12, density:
         transition: transform .15s ease, border-color .15s ease;
     }}
     .metric-tile:hover {{ transform: translateY(-2px); border-color: {accent}; }}
-    .metric-tile .label {{ color: {theme['muted']}; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }}
-    .metric-tile .value {{ font-size: 1.7rem; font-weight: 800; color: {theme['text']}; line-height: 1; }}
+    .metric-tile .label {{ color: {theme['muted']}; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }}
+    .metric-tile .value {{ font-size: {tile_val}rem; font-weight: 800; color: {theme['text']}; line-height: 1; }}
     .metric-tile .value.accent {{ color: {accent}; }}
 
     .panel {{
         background: {theme['panel']};
         border: 1px solid {theme['panel_border']};
         border-radius: var(--radius);
-        padding: 14px 18px; height: 100%;
+        padding: 18px 22px; height: 100%;
     }}
-    .panel-title {{ font-size: 0.9rem; font-weight: 700; color: {theme['text']}; margin: 0 0 8px 0; }}
+    .panel-title {{ font-size: 1.02rem; font-weight: 700; color: {theme['text']}; margin: 0 0 10px 0; }}
 
     .alert-panel {{
         background: linear-gradient(180deg, {theme['panel']}, #7f1d1d22);
@@ -187,8 +193,8 @@ def build_css(theme: dict, accent: str | None = None, radius: int = 12, density:
     .stButton > button {{
         border-radius: 999px;
         font-weight: 600;
-        font-size: 0.82rem;
-        padding: 0.48rem 0.9rem;
+        font-size: {nav_font}rem;
+        padding: 0.6rem 1.05rem;
         transition: transform .14s ease, border-color .14s ease, color .14s ease, box-shadow .14s ease;
         border: 1px solid {theme['panel_border']};
     }}
@@ -220,8 +226,8 @@ def build_css(theme: dict, accent: str | None = None, radius: int = 12, density:
     }}
 
     .section-label {{
-        font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em;
-        color: {theme['muted']}; font-weight: 700; margin: 4px 0 6px 4px;
+        font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em;
+        color: {theme['muted']}; font-weight: 700; margin: 6px 0 8px 4px;
     }}
 
     /* ---- Responsive ---- */
