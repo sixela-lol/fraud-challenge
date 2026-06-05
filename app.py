@@ -106,6 +106,9 @@ def _init_state() -> None:
         # Double contrôle (2e couche)
         "verify_rows": [],
         "verify_summary": {},
+        "auto_verify": True,
+        "verify_threshold": 0.55,
+        "verify_model": "isolation_forest",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -136,6 +139,28 @@ def _run_analysis(transactions: list[dict]) -> list[dict]:
     )
 
 
+def _run_verification(transactions, results) -> None:
+    """Lance la 2e couche (double contrôle) et stocke le résultat en session.
+
+    Appelé automatiquement après l'analyse si l'option est activée.
+    """
+    try:
+        bundle = ensure_model(
+            transactions, st.session_state.get("ml_bundle"),
+            st.session_state.get("verify_model", "isolation_forest"),
+        )
+        rows, summary = verify_transactions(
+            transactions, results, bundle,
+            float(st.session_state.get("verify_threshold", 0.55)),
+        )
+        st.session_state.verify_rows = rows
+        st.session_state.verify_summary = summary
+    except Exception:
+        # Le double contrôle est un complément : son échec ne bloque jamais l'analyse.
+        st.session_state.verify_rows = []
+        st.session_state.verify_summary = {}
+
+
 def _to_local(iso_ts: str) -> str:
     """Convertit un horodatage ISO (souvent UTC) en heure locale lisible."""
     if not iso_ts:
@@ -145,6 +170,18 @@ def _to_local(iso_ts: str) -> str:
         return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return iso_ts[:19].replace("T", " ")
+
+
+RISK_BADGE = {
+    "critique": "🔴 Critique",
+    "suspecte": "🟠 Suspecte",
+    "à surveiller": "🟡 À surveiller",
+    "normale": "🟢 Normale",
+}
+
+
+def _risk_badge(result) -> str:
+    return RISK_BADGE.get(result.get("risk_level", "normale"), "—")
 
 
 def _alert_pairs(transactions, results):
@@ -160,6 +197,8 @@ def _build_table_rows(transactions, results) -> pd.DataFrame:
             "Montant": f"{tx.get('amount')} {tx.get('currency')}",
             "Pays": tx.get("country") or "—",
             "Verdict": "Suspecte" if result.get("is_suspicious") else "Normale",
+            "Niveau": _risk_badge(result),
+            "Confiance": f"{float(result.get('confidence', 0)) * 100:.0f}%",
             "Explication": _display_reason(result),
         })
     return pd.DataFrame(rows)
@@ -674,11 +713,20 @@ def _render_alerts(transactions, results) -> None:
         st.markdown('<div class="ok-panel">✅ Aucune alerte — tout est normal.</div>', unsafe_allow_html=True)
         return
 
-    # Tri par score décroissant (les plus graves en premier)
-    alerts = sorted(alerts, key=lambda p: float(p[1].get("fraud_score") or 0), reverse=True)
+    # Tri par gravité (critique → suspecte → à surveiller), puis score
+    sev_rank = {"critique": 0, "suspecte": 1, "à surveiller": 2, "normale": 3}
+    alerts = sorted(
+        alerts,
+        key=lambda p: (sev_rank.get(p[1].get("risk_level"), 3),
+                       -float(p[1].get("fraud_score") or 0)),
+    )
 
+    n_crit = sum(1 for _, r in alerts if r.get("risk_level") == "critique")
+    n_susp = sum(1 for _, r in alerts if r.get("risk_level") == "suspecte")
+    n_watch = sum(1 for _, r in alerts if r.get("risk_level") == "à surveiller")
     st.markdown(
-        f'<p class="panel-title">⚠️ {len(alerts)} alerte(s) détectée(s) — triées par gravité</p>',
+        f'<p class="panel-title">⚠️ {len(alerts)} alerte(s) — '
+        f'🔴 {n_crit} critiques · 🟠 {n_susp} suspectes · 🟡 {n_watch} à surveiller</p>',
         unsafe_allow_html=True,
     )
 
@@ -686,13 +734,15 @@ def _render_alerts(transactions, results) -> None:
     cols = st.columns(2)
     for i, (tx, result) in enumerate(alerts):
         score = float(result.get("fraud_score") or 0)
+        conf = float(result.get("confidence", 0)) * 100
         with cols[i % 2]:
             st.markdown(
                 f"""
                 <div class="alert-panel">
-                    <h3>⚠️ {result.get("transaction_id")} — {_risk_label(score)}</h3>
+                    <h3>{_risk_badge(result)} — {result.get("transaction_id")}</h3>
                     <p><strong>Client :</strong> {tx.get("user_id")}
-                       · <strong>Score :</strong> {score:.2f}</p>
+                       · <strong>Score :</strong> {score:.2f}
+                       · <strong>Confiance :</strong> {conf:.0f}%</p>
                     <p><strong>Montant :</strong> {tx.get("amount")} {tx.get("currency")}
                        · <strong>Commerçant :</strong> {tx.get("merchant")}</p>
                     <p><strong>Pays :</strong> {tx.get("country") or "inconnu"}</p>
@@ -789,22 +839,34 @@ def _render_verify(transactions, results) -> None:
         "transactions jugées « normales » par les règles mais douteuses pour le modèle."
     )
 
+    auto = st.session_state.get("auto_verify", True)
+    if auto:
+        st.success("✅ Double contrôle **automatique** activé — il tourne à chaque analyse. "
+                   "Désactivable dans la barre latérale.")
+    else:
+        st.warning("Double contrôle automatique **désactivé** (réactivable dans la barre latérale). "
+                   "Tu peux le lancer ponctuellement ci-dessous.")
+
     c0 = st.columns([1.4, 1.4, 1])
     with c0[0]:
-        threshold = st.slider("Seuil de doute du modèle", 0.30, 0.90, 0.55, 0.05)
+        threshold = st.slider(
+            "Seuil de doute du modèle", 0.30, 0.90,
+            float(st.session_state.get("verify_threshold", 0.55)), 0.05)
     with c0[1]:
+        model_options = ["isolation_forest", "decision_tree"]
         model_type = st.selectbox(
-            "Modèle de la 2ᵉ couche", ["isolation_forest", "decision_tree"],
+            "Modèle de la 2ᵉ couche", model_options,
+            index=model_options.index(st.session_state.get("verify_model", "isolation_forest")),
             format_func=lambda m: {"isolation_forest": "Détection d'anomalies",
                                    "decision_tree": "Arbre de décision"}[m],
         )
     with c0[2]:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        run = st.button("Lancer le double contrôle", type="primary", use_container_width=True)
+        run = st.button("Relancer maintenant", use_container_width=True)
 
-    if not run and not st.session_state.get("verify_rows"):
-        st.info("Choisissez un modèle puis lancez le double contrôle.")
-        return
+    # Mémorise les réglages pour les prochains lancements automatiques
+    st.session_state.verify_threshold = threshold
+    st.session_state.verify_model = model_type
 
     if run:
         try:
@@ -819,6 +881,7 @@ def _render_verify(transactions, results) -> None:
     rows = st.session_state.get("verify_rows", [])
     summary = st.session_state.get("verify_summary", {})
     if not rows:
+        st.info("Aucun résultat. Lance une analyse (le double contrôle suivra) ou clique « Relancer maintenant ».")
         return
 
     # KPI : 4 quadrants du croisement
@@ -1117,10 +1180,16 @@ def _sidebar() -> list[dict]:
 
         if st.button("▶ Analyser", type="primary", use_container_width=True):
             if transactions:
-                st.session_state.results = _run_analysis(transactions)
+                results = _run_analysis(transactions)
+                st.session_state.results = results
                 st.session_state.analyzed = True
                 st.session_state.view = "home"
                 st.session_state.alert_index = 0
+                if st.session_state.get("auto_verify", True):
+                    _run_verification(transactions, results)
+                else:
+                    st.session_state.verify_rows = []
+                    st.session_state.verify_summary = {}
                 st.rerun()
             else:
                 st.warning("Chargez un fichier.")
@@ -1136,6 +1205,9 @@ def _sidebar() -> list[dict]:
         with st.expander("🎨 Apparence"):
             _appearance_controls()
 
+        st.session_state.auto_verify = st.toggle(
+            "Double contrôle automatique", st.session_state.get("auto_verify", True),
+            help="Lance la 2e couche (modèle de prédiction) à chaque analyse.")
         st.session_state.human_mode = st.toggle(
             "Explications humaines", st.session_state.get("human_mode", True))
         st.session_state.persist_history = st.toggle(

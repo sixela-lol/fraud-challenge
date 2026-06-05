@@ -189,15 +189,21 @@ def detect_fraud(transactions, config=None, ml_bundle=None):
     Sans paramètres, la CI utilise la configuration par défaut (règles seules).
     """
     results = analyze_fraud(transactions, config, ml_bundle)
-    return [
-        {
+    output = []
+    for item in results:
+        level = item.get("risk_level")
+        confidence = item.get("confidence")
+        if level is None or confidence is None:
+            level, confidence = _risk_meta(item["fraud_score"], item["is_suspicious"])
+        output.append({
             "transaction_id": item["transaction_id"],
             "fraud_score": item["fraud_score"],
             "is_suspicious": item["is_suspicious"],
             "reason": item["reason"],
-        }
-        for item in results
-    ]
+            "risk_level": level,
+            "confidence": confidence,
+        })
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -260,12 +266,57 @@ def _prior_amounts(history):
     ]
 
 
+# Fiabilité de chaque règle → niveau de risque affiché (le verdict
+# is_suspicious n'est jamais modifié, on exprime seulement la confiance).
+RULE_SEVERITY = {
+    "amount_invalid": "critique",      # montant négatif/nul : quasi certain
+    "geo_anomaly": "critique",         # saut géographique impossible : fort
+    "duplicate": "critique",           # doublon : fort
+    "missing_fields": "suspecte",      # qualité de donnée, pas toujours fraude
+    "amount_spike": "suspecte",        # pic de montant : probable
+    "frequency": "à surveiller",       # fréquence : sujet aux faux positifs
+    "card_not_present": "à surveiller",  # carte absente : indice faible seul
+    "watch": "à surveiller",
+    "safe": "normale",
+}
+
+SEVERITY_CONFIDENCE = {
+    "critique": 0.92,
+    "suspecte": 0.72,
+    "à surveiller": 0.52,
+    "normale": 0.95,
+}
+
+
+def _risk_meta(score, is_suspicious):
+    """Niveau de risque + confiance dérivés du score (fallback, ex. ML)."""
+    score = round(max(0.0, min(1.0, score)), 2)
+    if is_suspicious:
+        level = "critique" if score >= 0.85 else "suspecte" if score >= 0.6 else "à surveiller"
+        confidence = score
+    elif score >= 0.30:
+        level = "à surveiller"
+        confidence = round(1.0 - score, 2)
+    else:
+        level = "normale"
+        confidence = round(1.0 - score, 2)
+    return level, confidence
+
+
 def _build_result(transaction_id, fraud_score, is_suspicious, reason, rule_id=None):
+    score = round(max(0.0, min(1.0, fraud_score)), 2)
+    if rule_id in RULE_SEVERITY:
+        level = RULE_SEVERITY[rule_id]
+        confidence = SEVERITY_CONFIDENCE[level] if is_suspicious else round(1.0 - score, 2)
+    else:
+        level, confidence = _risk_meta(score, is_suspicious)
     result = {
         "transaction_id": transaction_id,
-        "fraud_score": round(max(0.0, min(1.0, fraud_score)), 2),
+        "fraud_score": score,
         "is_suspicious": is_suspicious,
         "reason": reason,
+        "risk_level": level,
+        "confidence": confidence,
     }
     if rule_id:
         result["rule_id"] = rule_id
@@ -361,12 +412,70 @@ def _evaluate_rules(transactions, config):
             seen_ids.add(transaction_id)
             continue
 
-        results.append(_build_result(
-            transaction_id, safe["score"], False, safe["message"], "safe",
-        ))
+        watch_score, watch_reason = _soft_watch(transaction, history, batch, thresholds)
+        if watch_reason:
+            results.append(_build_result(
+                transaction_id, watch_score, False, watch_reason, "watch",
+            ))
+        else:
+            results.append(_build_result(
+                transaction_id, safe["score"], False, safe["message"], "safe",
+            ))
         seen_ids.add(transaction_id)
 
     return results
+
+
+def _soft_watch(transaction, history, batch, thresholds):
+    """Signaux faibles : range un cas limite en « à surveiller » sans alerter.
+
+    Ne déclenche jamais d'alerte ferme (is_suspicious reste False) : sert
+    uniquement à donner un niveau de confiance et à réduire les faux positifs
+    en évitant de tout marquer fraude/normal.
+    """
+    amount = transaction.get("amount")
+    reasons = []
+    score = 0.0
+
+    # Paiement sans carte sur un montant moyen (sous le seuil d'alerte ferme).
+    cnp_min = thresholds.get("card_not_present_min", 1000)
+    if (
+        transaction.get("card_present") is False
+        and isinstance(amount, (int, float)) and amount > 0
+        and amount >= cnp_min * 0.5
+    ):
+        score = max(score, 0.40)
+        reasons.append("paiement sans carte sur un montant moyen")
+
+    # Activité juste sous le seuil de fréquence.
+    freq_window = thresholds.get("freq_window_hours")
+    freq_threshold = thresholds.get("freq_threshold")
+    ts = _parse_timestamp(transaction.get("timestamp"))
+    if freq_window and freq_threshold and ts is not None:
+        count = 0
+        for other in batch:
+            other_ts = _parse_timestamp(other.get("timestamp"))
+            if other_ts is not None and abs((ts - other_ts).total_seconds()) / 3600 <= freq_window:
+                count += 1
+        if count == freq_threshold - 1:
+            score = max(score, 0.38)
+            reasons.append("activité un peu élevée")
+
+    # Montant modérément au-dessus de l'habitude (sous le seuil de pic).
+    prior = _prior_amounts(history)
+    if (
+        isinstance(amount, (int, float)) and amount > 0
+        and len(prior) >= thresholds.get("amount_history_min", 3)
+    ):
+        baseline = statistics.median(prior)
+        spike = thresholds.get("amount_spike_factor", 4)
+        if baseline > 0 and 1.8 * baseline <= amount < spike * baseline:
+            score = max(score, 0.42)
+            reasons.append("montant au-dessus de l'habitude")
+
+    if reasons:
+        return score, "À surveiller : " + ", ".join(reasons)
+    return 0.0, None
 
 
 def _has_rapid_country_change(transaction, batch, geo_window_hours):
@@ -569,11 +678,17 @@ def _analyze_transactions(transactions, config, ml_bundle=None):
 
 
 def _public_result(result):
+    level = result.get("risk_level")
+    confidence = result.get("confidence")
+    if level is None or confidence is None:
+        level, confidence = _risk_meta(result["fraud_score"], result["is_suspicious"])
     return {
         "transaction_id": result["transaction_id"],
         "fraud_score": result["fraud_score"],
         "is_suspicious": result["is_suspicious"],
         "reason": result["reason"],
+        "risk_level": level,
+        "confidence": confidence,
     }
 
 
@@ -582,16 +697,19 @@ def _analyze_ml_only(transactions, ml_bundle, config):
     threshold = float(config.get("ml_threshold", 0.55))
     results = []
     for index, tx in enumerate(transactions):
-        score = ml_scores[index]
+        score = round(ml_scores[index], 2)
         suspicious = score >= threshold
+        level, confidence = _risk_meta(score, suspicious)
         results.append({
             "transaction_id": tx.get("transaction_id") or f"UNKNOWN-{index}",
-            "fraud_score": round(score, 2),
+            "fraud_score": score,
             "is_suspicious": suspicious,
             "reason": (
                 f"Anomalie détectée par le modèle ({ml_bundle.get('model_type', 'ml')})"
                 if suspicious else config["safe"]["message"]
             ),
+            "risk_level": level,
+            "confidence": confidence,
             "source": "ml",
         })
     return results
@@ -622,11 +740,15 @@ def _fuse_results(rule_results, ml_scores, config):
             reason = _compose_reason(rule_reason, ml_score, suspicious, rule_result["is_suspicious"])
             source = "hybrid_weighted"
 
+        final_score = round(max(0.0, min(1.0, final_score)), 2)
+        level, confidence = _risk_meta(final_score, suspicious)
         fused.append({
             "transaction_id": rule_result["transaction_id"],
-            "fraud_score": round(max(0.0, min(1.0, final_score)), 2),
+            "fraud_score": final_score,
             "is_suspicious": suspicious,
             "reason": reason,
+            "risk_level": level,
+            "confidence": confidence,
             "ml_score": round(ml_score, 2),
             "source": source,
         })
